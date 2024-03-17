@@ -9,13 +9,15 @@ print("Is MPS enabled?", torch.backends.mps.is_available())
 # hyperparameters
 batch_size = 32  # how many independent sequences will we process in parallel?
 block_size = 8  # what is the maximum context length for predictions?
-max_iters = 3000
-eval_interval = 300
-learning_rate = 1e-2
-device = 'mps' if torch.backends.mps.is_available() else 'cpu'  # check if cuda is available
-device = 'cuda' if torch.cuda.is_available() else 'cpu'
+max_iters = 5000
+eval_interval = 500
+learning_rate = 1e-3
+# device = 'cuda' if torch.cuda.is_available() else 'cpu'
+device = 'mps' if torch.backends.mps.is_available(
+) else 'cpu'  # check if cuda is available
 print("Device:", device)
 eval_iters = 200
+n_embd = 32  # how many dimensions to use in the embedding
 # ------------
 
 torch.manual_seed(1337)
@@ -69,20 +71,69 @@ def estimate_loss():
     model.train()
     return out
 
+
+class Head(nn.Module):
+    """ one head of self attention """
+
+    def __init__(self, head_size):
+        super().__init__()
+        self.key = nn.Linear(n_embd, head_size, bias=False)
+        self.query = nn.Linear(n_embd, head_size, bias=False)
+        self.value = nn.Linear(n_embd, head_size, bias=False)
+        self.register_buffer('tril', torch.tril(
+            torch.ones(block_size, block_size)))
+
+    def forward(self, x):
+        B, T, C = x.shape
+        k = self.key(x)  # (B,T,head_size)
+        q = self.query(x)
+
+        # (B,T,C) @ (B,C,T) = (B,T,T)
+        wei = q @ k.transpose(-2, -1) * C**(-0.5)
+        wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf'))  # (B,T,T)
+        wei = F.softmax(wei, dim=-1)  # (B,T,T)
+        v = self.value(x)  # (B,T,head_size)
+        out = wei @ v  # (B,T,T) @ (B,T,head_size) = (B,T,head_size)
+        return out
+
+
+class MultiHeadAttention(nn.Module):
+    """ multiple heads of self attention in parallel """
+
+    def __init__(self, num_heads, head_size):
+        super().__init__()
+        self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
+
+    def forward(self, x):
+        return torch.cat([h(x) for h in self.heads], dim=-1)
+
 # super simple bigram model
 
 
 class BigramLanguageModel(nn.Module):
 
-    def __init__(self, vocab_size):
+    def __init__(self):
         super().__init__()
         # each token directly reads off the logits for the next token from a lookup table
-        self.token_embedding_table = nn.Embedding(vocab_size, vocab_size)
+        # the model is learning a representation for each token
+        self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
+        # the model is learning a representation for each position
+        self.position_embedding_table = nn.Embedding(block_size, n_embd)
+        # the model is learning a representation for each token and position in the context // before self attention head
+        self.sa_head = MultiHeadAttention(4, n_embd//4)
+        # the model is learning a representation for each token
+        self.lm_head = nn.Linear(n_embd, vocab_size)
 
     def forward(self, idx, targets=None):
-
+        B, T = idx.shape
         # idx and targets are both (B,T) tensor of integers
-        logits = self.token_embedding_table(idx)  # (B,T,C)
+        token_emb = self.token_embedding_table(idx)  # (B,T,C=embd size)
+        pos_emb = self.position_embedding_table(
+            torch.arange(T, device=device))  # (T,C=embd size)
+        x = token_emb + pos_emb  # (B,T,C=embd size)
+        # apply one head of self attention (B,T,C=embd size)
+        x = self.sa_head(x)
+        logits = self.lm_head(x)  # (B,T,Vocab size)
 
         if targets is None:
             loss = None
@@ -97,8 +148,10 @@ class BigramLanguageModel(nn.Module):
     def generate(self, idx, max_new_tokens):
         # idx is (B, T) array of indices in the current context
         for _ in range(max_new_tokens):
+            # crop idx to the last block_size tokens
+            idx_cond = idx[:, -block_size:]  # (B, min(T, block_size))
             # get the predictions
-            logits, loss = self(idx)
+            logits, loss = self(idx_cond)
             # focus only on the last time step
             logits = logits[:, -1, :]  # becomes (B, C)
             # apply softmax to get probabilities
@@ -110,7 +163,7 @@ class BigramLanguageModel(nn.Module):
         return idx
 
 
-model = BigramLanguageModel(vocab_size)
+model = BigramLanguageModel()
 m = model.to(device)
 
 # create a PyTorch optimizer
