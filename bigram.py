@@ -7,17 +7,20 @@ print("Is CUDA enabled?", torch.cuda.is_available())
 print("Is MPS enabled?", torch.backends.mps.is_available())
 
 # hyperparameters
-batch_size = 32  # how many independent sequences will we process in parallel?
-block_size = 8  # what is the maximum context length for predictions?
+batch_size = 64  # how many independent sequences will we process in parallel?
+block_size = 256  # what is the maximum context length for predictions?
 max_iters = 5000
 eval_interval = 500
-learning_rate = 1e-3
+learning_rate = 3e-4
 # device = 'cuda' if torch.cuda.is_available() else 'cpu'
 device = 'mps' if torch.backends.mps.is_available(
 ) else 'cpu'  # check if cuda is available
 print("Device:", device)
 eval_iters = 200
-n_embd = 32  # how many dimensions to use in the embedding
+n_embd = 384  # how many dimensions to use in the embedding
+n_head = 6  # how many independent attention heads to use
+n_layer = 6  # how many layers in the model
+dropout = 0.2  # what dropout to apply within the model
 # ------------
 
 torch.manual_seed(1337)
@@ -83,6 +86,8 @@ class Head(nn.Module):
         self.register_buffer('tril', torch.tril(
             torch.ones(block_size, block_size)))
 
+        self.dropout = nn.Dropout(dropout)
+
     def forward(self, x):
         B, T, C = x.shape
         k = self.key(x)  # (B,T,head_size)
@@ -92,6 +97,7 @@ class Head(nn.Module):
         wei = q @ k.transpose(-2, -1) * C**(-0.5)
         wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf'))  # (B,T,T)
         wei = F.softmax(wei, dim=-1)  # (B,T,T)
+        wei = self.dropout(wei)  # (B,T,T)
         v = self.value(x)  # (B,T,head_size)
         out = wei @ v  # (B,T,T) @ (B,T,head_size) = (B,T,head_size)
         return out
@@ -103,11 +109,13 @@ class MultiHeadAttention(nn.Module):
     def __init__(self, num_heads, head_size):
         super().__init__()
         self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
-        self.proj = nn.Linear(n_embd, n_embd) # project the output back to n_embd
+        # project the output back to n_embd
+        self.proj = nn.Linear(n_embd, n_embd)
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
-        out = torch.cat([h(x) for h in self.heads], dim=-1) # (B,T,n_embd)
-        out = self.proj(out) # (B,T,n_embd)
+        out = torch.cat([h(x) for h in self.heads], dim=-1)  # (B,T,n_embd)
+        out = self.dropout(self.proj(out))  # (B,T,n_embd)
         return out
 
 
@@ -120,6 +128,7 @@ class FeedForward(nn.Module):
             nn.Linear(n_embd, 4 * n_embd),
             nn.ReLU(),
             nn.Linear(4 * n_embd, n_embd),
+            nn.Dropout(dropout),
         )
 
     def forward(self, x):
@@ -156,11 +165,8 @@ class BigramLanguageModel(nn.Module):
         # the model is learning a representation for each position
         self.position_embedding_table = nn.Embedding(block_size, n_embd)
         self.blocks = nn.Sequential(
-            Block(n_embd, n_head=4),
-            Block(n_embd, n_head=4),
-            Block(n_embd, n_head=4),
-            nn.LayerNorm(n_embd),  # normalize the output of the last block
-        )
+            *[Block(n_embd, n_head=n_head) for _ in range(n_layer)])
+        self.ln_f = nn.LayerNorm(n_embd)  # layer norm for the final output
         self.lm_head = nn.Linear(n_embd, vocab_size)
 
     def forward(self, idx, targets=None):
@@ -171,7 +177,8 @@ class BigramLanguageModel(nn.Module):
             torch.arange(T, device=device))  # (T,C=embd size)
         x = token_emb + pos_emb  # (B,T,C=embd size)
         # apply one head of self attention (B,T,C=embd size)
-        x = self.blocks(x) # (B,T,C=embd size)
+        x = self.blocks(x)  # (B,T,C=embd size)
+        x = self.ln_f(x)  # (B,T,C=embd size)
         logits = self.lm_head(x)  # (B,T,Vocab size)
 
         if targets is None:
